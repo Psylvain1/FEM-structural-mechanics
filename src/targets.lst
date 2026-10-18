@@ -1,0 +1,40 @@
+{
+library : {
+name   : "Behaviour";
+type   : SHARED_LIBRARY;
+prefix : "lib";
+suffix : "so";
+install_path : "";
+sources : {
+"DruckerPragerCap-generic.cxx",
+"DruckerPragerCap.cxx"
+};
+cppflags : {
+"$(shell tfel-config --cppflags --compiler-flags)"
+};
+include_directories : {
+"$(shell tfel-config --include-path)"
+};
+link_directories : {
+"$(shell tfel-config --library-path)"
+};
+link_libraries : {
+"$(shell tfel-config --library-dependency --material --mfront-profiling)"
+};
+epts : {
+"DruckerPragerCap_AxisymmetricalGeneralisedPlaneStrain",
+"DruckerPragerCap_AxisymmetricalGeneralisedPlaneStress",
+"DruckerPragerCap_Axisymmetrical",
+"DruckerPragerCap_PlaneStress",
+"DruckerPragerCap_PlaneStrain",
+"DruckerPragerCap_GeneralisedPlaneStrain",
+"DruckerPragerCap_Tridimensional"
+};
+};
+headers : {
+"MFront/GenericBehaviour/DruckerPragerCap-generic.hxx",
+"TFEL/Material/DruckerPragerCap.hxx",
+"TFEL/Material/DruckerPragerCapBehaviourData.hxx",
+"TFEL/Material/DruckerPragerCapIntegrationData.hxx"
+};
+};

@@ -1,0 +1,158 @@
+import numpy as np
+from mpi4py import MPI
+import dolfinx
+from dolfinx import mesh, fem, default_scalar_type
+import ufl
+from dolfinx.fem.petsc import NonlinearProblem
+from dolfinx.nls.petsc import NewtonSolver
+
+# ==========================================
+# 1. Paramètres du modèle
+# ==========================================
+L, H = 5.0, 1.0  # Dimensions de la poutre (m)
+x_interface = H / 2.0  # Position de l'interface
+
+# Propriétés Béton 1 (Gauche)
+E1 = 38e9  # 36 GPa
+nu1 = 0.2
+
+# Propriétés Béton 2 (Droite)
+E2 = 38e9  # 38 GPa
+nu2 = 0.2
+
+# Propriétés de l'interface (Mohr-Coulomb)
+tau_c = 1e6  # Cohésion = 1 MPa
+phi = np.radians(21.7)  # Angle de frottement en radians
+tan_phi = np.tan(phi)
+k_n = 1e12  # Rigidité normale de l'interface (pénalité)
+k_t = 1e12  # Rigidité tangentielle de l'interface
+
+# ==========================================
+# 2. Maillage et définition des sous-domaines
+# ==========================================
+domain = mesh.create_rectangle(MPI.COMM_WORLD, [np.array([0.0, 0.0]), np.array([L, H])], [100, 20], cell_type=mesh.CellType.triangle)
+
+# ---------------------------------------------------------
+# CORRECTION FENICSX 0.9.0 : functionspace unifié
+# On précise (domain.geometry.dim,) pour en faire un vecteur
+# ---------------------------------------------------------
+V = fem.functionspace(domain, ("Lagrange", 1, (domain.geometry.dim,)))
+
+eps=1e-8
+# Création des tags pour les cellules (matériaux)
+def left_concrete(x):
+    return x[1] <= x_interface + eps
+
+def right_concrete(x):
+    return x[1] > x_interface -eps
+
+# Espaces pour définir les propriétés hétérogènes (DG0)
+V_E = fem.functionspace(domain, ("DG", 0)) # FEniCSx 0.9.0
+E_func = fem.Function(V_E)
+
+# Assignation de E selon la position
+cells_left = mesh.locate_entities(domain, domain.topology.dim, left_concrete)
+cells_right = mesh.locate_entities(domain, domain.topology.dim, right_concrete)
+E_func.x.array[cells_left] = E1
+E_func.x.array[cells_right] = E2
+
+
+# Localisation de l'interface pour la mesure dS
+def interface_locator(x):
+    return np.isclose(x[0], x_interface)
+
+# Création d'un meshtag pour restreindre l'intégrale dS à l'interface
+# (Nécessaire dans les versions récentes pour cibler précisément la discontinuité)
+fdim = domain.topology.dim - 1
+facets_interface = mesh.locate_entities(domain, fdim, interface_locator)
+facet_tags = mesh.meshtags(domain, fdim, facets_interface, np.full_like(facets_interface, 1, dtype=np.int32))
+
+# ==========================================
+# 3. Lois de comportement (Bulk)
+# ==========================================
+u = fem.Function(V, name="Displacement")
+v = ufl.TestFunction(V)
+
+# Paramètres de Lamé
+mu = E_func / (2 * (1 + nu1))
+lmbda = E_func * nu1 / ((1 + nu1) * (1 - 2 * nu1))
+
+def epsilon(u):
+    return ufl.sym(ufl.grad(u))
+
+def sigma(u):
+    return lmbda * ufl.tr(epsilon(u)) * ufl.Identity(len(u)) + 2.0 * mu * epsilon(u)
+
+# ==========================================
+# 4. Loi d'interface (Traction-Séparation & Mohr-Coulomb)
+# ==========================================
+n = ufl.FacetNormal(domain)
+
+# Sauts de déplacement à l'interface
+jump_u = ufl.jump(u)
+jump_un = ufl.dot(jump_u, n('+')) 
+jump_ut = jump_u - jump_un * n('+')
+
+# Vecteur de traction élastique (Trial state)
+t_n_trial = k_n * jump_un
+t_t_trial = k_t * jump_ut
+
+tau_max = tau_c - ufl.conditional(ufl.lt(t_n_trial, 0), t_n_trial, 0) * tan_phi
+norm_t_t = ufl.sqrt(ufl.dot(t_t_trial, t_t_trial) + 1e-10)
+
+t_t = ufl.conditional(ufl.lt(norm_t_t, tau_max), 
+                      t_t_trial, 
+                      tau_max * (t_t_trial / norm_t_t))
+
+t_n = t_n_trial 
+traction_vector = t_n * n('+') + t_t
+
+# ==========================================
+# 5. Formulation Variationnelle
+# ==========================================
+dx = ufl.Measure("dx", domain=domain)
+# On lie dS au tag "1" que l'on a créé sur l'interface
+dS = ufl.Measure("dS", domain=domain, subdomain_data=facet_tags, subdomain_id=1) 
+
+F_bulk = ufl.inner(sigma(u), epsilon(v)) * dx
+F_interface = ufl.inner(traction_vector, ufl.jump(v)) * dS 
+
+f = fem.Constant(domain, default_scalar_type((0.0, -1000)))
+F_ext = ufl.inner(f, v) * dx
+
+F = F_bulk +F_interface - F_ext
+
+# ==========================================
+# 6. Conditions aux limites (Encastrement à gauche)
+# ==========================================
+
+def left_boundary(x):
+    return np.logical_or.reduce([np.isclose(x[0], 0.0),np.isclose(x[0],L)])
+
+left_facets = mesh.locate_entities_boundary(domain, fdim, left_boundary)
+left_dofs = fem.locate_dofs_topological(V, fdim, left_facets)
+# Utilisation de default_scalar_type pour la compatibilité PETSc
+bc = fem.dirichletbc(np.zeros(domain.geometry.dim, dtype=default_scalar_type), left_dofs, V)
+
+# ==========================================
+# 7. Solveur Non-Linéaire
+# ==========================================
+J = ufl.derivative(F, u)
+
+problem = NonlinearProblem(F, u, bcs=[bc], J=J)
+solver = NewtonSolver(MPI.COMM_WORLD, problem)
+solver.convergence_criterion = "incremental"
+solver.rtol = 1e-6
+
+print("Début de la résolution non-linéaire...")
+num_its, converged = solver.solve(u)
+print(f"Solveur a convergé en {num_its} itérations.")
+
+# Sauvegarde des résultats
+from dolfinx.io import VTXWriter
+from dolfinx import io
+with VTXWriter(MPI.COMM_WORLD, "beam_displacement.pvd", u, engine="BP4") as vtx:
+    vtx.write(0.0)
+vtx_file = io.VTKFile(domain.comm, "/home/sylv/Thèse/Mécanique/plasticity/beamdisplacement.pvd", "w")
+vtx_file.write_function(u) 
+vtx_file.close()
